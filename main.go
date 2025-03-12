@@ -2,71 +2,107 @@ package main
 
 import (
 	"flag"
-    "encoding/csv"
-    "fmt"
-	"log"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
-
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/pcap"
 )
 
+const (
+	zeekLogsDir        = "zeek_logs"
+	coreLogsDir        = "zeek_logs/core"
+	networkServicesDir = "zeek_logs/network_services"
+	applicationLogsDir = "zeek_logs/application"
+)
+
+var coreLogs = []string{"conn.log", "dns.log", "http.log", "files.log", "ssl.log"}
+var networkLogs = []string{"ftp.log", "smtp.log", "ssh.log", "rdp.log", "ldap.log"}
+var applicationLogs = []string{"pe.log", "ntp.log", "quic.log", "traceroute.log"}
+
 func main() {
-	pcapFile := flag.String("f", "", "Path to the PCAP file")
+	pcapFile := flag.String("pcap", "", "Path to the input PCAP file")
 	flag.Parse()
 
 	if *pcapFile == "" {
-		log.Fatal("Usage: ./main.go -f <pcap_file>")
+		fmt.Println("Usage: go run main.go -pcap <pcap_file>")
+		os.Exit(1)
 	}
 
-	logDir := "zeek_logs"
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		log.Fatalf("Error creating log directory: %v", err)
-	}
-
-	handle, err := pcap.OpenOffline(*pcapFile)
+	absPcapFile, err := filepath.Abs(*pcapFile)
 	if err != nil {
-		log.Fatalf("Error opening PCAP file: %v", err)
+		fmt.Println("Error getting absolute path:", err)
+		os.Exit(1)
 	}
-	defer handle.Close()
 
-	logPath := filepath.Join(logDir, "conn.log")
-	logFile, err := os.Create(logPath)
+	if _, err := os.Stat(absPcapFile); os.IsNotExist(err) {
+		fmt.Println("Error: PCAP file does not exist:", absPcapFile)
+		os.Exit(1)
+	}
+
+	createZeekDirectories()
+
+	if err := runZeek(absPcapFile); err != nil {
+		fmt.Println("Zeek processing failed:", err)
+		os.Exit(1)
+	}
+
+	categorizeLogs()
+
+	fmt.Println("Zeek logs generated in:", zeekLogsDir)
+}
+
+func createZeekDirectories() {
+	dirs := []string{coreLogsDir, networkServicesDir, applicationLogsDir}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			fmt.Println("Error creating directory:", dir, "-", err)
+			os.Exit(1)
+		}
+	}
+}
+
+func runZeek(pcap string) error {
+	cmd := exec.Command("zeek", "-r", pcap)
+	cmd.Dir = zeekLogsDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func categorizeLogs() {
+	files, err := os.ReadDir(zeekLogsDir)
 	if err != nil {
-		log.Fatalf("Error creating conn.log: %v", err)
+		fmt.Println("Error reading Zeek log directory:", err)
+		return
 	}
-	defer logFile.Close()
-	writer := csv.NewWriter(logFile)
-	defer writer.Flush()
 
-	headers := []string{"ts", "src_ip", "src_port", "dst_ip", "dst_port", "protocol"}
-	writer.Write(headers)
+	for _, file := range files {
+		filePath := filepath.Join(zeekLogsDir, file.Name())
+		var targetDir string
 
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-
-	for packet := range packetSource.Packets() {
-		networkLayer := packet.NetworkLayer()
-		transportLayer := packet.TransportLayer()
-
-		if networkLayer == nil || transportLayer == nil {
-			continue
+		switch {
+		case contains(coreLogs, file.Name()):
+			targetDir = coreLogsDir
+		case contains(networkLogs, file.Name()):
+			targetDir = networkServicesDir
+		case contains(applicationLogs, file.Name()):
+			targetDir = applicationLogsDir
+		default:
+			targetDir = zeekLogsDir
 		}
 
-		srcIP, dstIP := networkLayer.NetworkFlow().Endpoints()
-		srcPort, dstPort := transportLayer.TransportFlow().Endpoints()
-		protocol := transportLayer.LayerType().String()
-		record := []string{
-			fmt.Sprintf("%v", packet.Metadata().Timestamp.Unix()), // Timestamp
-			srcIP.String(),
-			srcPort.String(),
-			dstIP.String(),
-			dstPort.String(),
-			protocol,
+		newPath := filepath.Join(targetDir, file.Name())
+		if err := os.Rename(filePath, newPath); err != nil {
+			fmt.Println("Error moving file:", file.Name(), "to", targetDir, "-", err)
 		}
-
-		writer.Write(record)
 	}
+}
 
-	fmt.Printf("PCAP successfully converted to Zeek-style logs in %s/\n", logDir)
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
